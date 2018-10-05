@@ -6,10 +6,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <errno.h>
 #include "cpa_sample_utils.h"
 #include "cpa.h"
 
 extern const char *__progname;
+extern int errno;
+
+#define RT_PRINT(fmt, args...) { printf("INFO: %s(): "fmt, __func__, ##args); }
+#ifdef RT_DEBUG
+#define RT_PRINT_DBG(fmt, args...) { printf("DBG: %s(): "fmt, __func__, ##args); }
+#else
+#define RT_PRINT_DBG(args...) { do {} while(0); }
+#endif  // RT_DEBUG
+#define RT_PRINT_ERR(fmt, args...) {    \
+    fprintf(stderr, "ERR: %s(): "fmt, __func__, ##args); }
 
 #define CHECK(expr) {                                                           \
     CpaStatus rc = (expr);                                                      \
@@ -23,6 +34,19 @@ extern const char *__progname;
         exit(EXIT_FAILURE);                                                     \
     }                                                                           \
 }
+
+#define OS_CHECK(expr) {                                                        \
+    int rc = (expr);                                                            \
+    if (-1 == rc) {                                                             \
+        fprintf(stderr, "%s: %s:%d: %s(): ",                                    \
+                __progname, __FILE__, __LINE__, __func__);                      \
+        fprintf(stderr, "Assertion `(-1 != (%s))' failed:\n",                   \
+                #expr);                                                         \
+        fprintf(stderr, "\t%s returns %d: %s: cannot survive.\nAborted\n",      \
+                #expr, errno, strerror(errno));                                 \
+        exit(EXIT_FAILURE);                                                     \
+    }                                                                           \
+}                                                                               \
 
 static char *cpaErrStr(CpaStatus errStatus)
 {
@@ -71,5 +95,7 @@ static char *cpaErrStr(CpaStatus errStatus)
 
     return errStr;
 }
+
+// TODO
 
 #endif  // RT_UTILS_H

@@ -6,6 +6,8 @@
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
 
@@ -17,11 +19,11 @@
 #include "rt_utils.h"
 
 #define TIMEOUT_MS  5000 /* 5 seconds */
-#define MAX_PATH     1024
+#define MAX_PATH    1024
 // Function qatMemAllocNUMA can only allocate a contiguous memory with size up
 // to 4MB, otherwise return error.
-#define MAX_HW_BUFSZ    4*1024*1024 // 4MB
-#define AES_BLOCKSZ     32          // Bytes
+#define MAX_HW_BUFSZ    1*1024*1024 // 1 MB
+#define AES_BLOCKSZ     32          // 32 Bytes (256 bits)
 #define MAX_INSTANCES   16
 
 typedef struct {
@@ -34,9 +36,8 @@ typedef struct {
 } CmdlineArgs;
 
 typedef struct {
-    char *src;
-    char *dst;
-    unsigned int totalBytes;    // Should round to times of AES_BLOCKSZ
+    char *src, *dst;
+    unsigned int totalBytes;
     int nrBatch;
     int isAsync;
     int threadId;
@@ -56,6 +57,12 @@ typedef struct {
     CpaCySymSessionCtx ctx;
 } QatAes256EcbSession;
 
+typedef struct RunTime_ {
+    struct timeval timeS;
+    struct timeval timeE;
+    struct RunTime_ *next;
+} RunTime;
+
 static QatHardware gQatHardware = {
     .mutex = PTHREAD_MUTEX_INITIALIZER,
     .isInit = 0,
@@ -65,11 +72,46 @@ static CmdlineArgs gCmdlineArgs = {
     .isDebug = 1,
     .isAsync = 0,
     .nrBatch = 1,
-    .nrThread = 1,
-    .fileToWrite = "/dev/stdout"};
+    .nrThread = 1};
 
-// 256 bits-long key
-static Cpa8U sampleCipherKey[] = {"12345678901234567890123456789012"};
+// 256 bits-long
+static Cpa8U sampleCipherKey[] = {
+//    0     1     2     3     4     5     6     7
+    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,};
+
+static RunTime *gRunTimeHead = NULL;
+static pthread_mutex_t gMutex = PTHREAD_MUTEX_INITIALIZER;
+
+void runTimePush(RunTime *pNode)
+{
+    pthread_mutex_lock(&gMutex);
+    pNode->next = gRunTimeHead;
+    gRunTimeHead = pNode;
+    pthread_mutex_unlock(&gMutex);
+}
+
+void showStats(RunTime *pHead, unsigned int totalBytes)
+{
+    unsigned long usBegin = 0;
+    unsigned long usEnd   = 0;
+    double usDiff         = 0;
+
+    for (RunTime *pCurr = pHead; pCurr != NULL; pCurr = pCurr->next) {
+        usBegin = pCurr->timeS.tv_sec * 1e6 + pCurr->timeS.tv_sec;
+        usEnd   = pCurr->timeE.tv_sec * 1e6 + pCurr->timeE.tv_sec;
+        usDiff  += (usEnd - usBegin);
+    }
+
+    assert(0 != usDiff);
+    assert(0 != totalBytes);
+    double throughput = ((double)totalBytes * 8) / usDiff;
+
+    RT_PRINT("Time taken:     %9.3lf ms\n", usDiff / 1000);
+    RT_PRINT("Throughput:     %9.3lf Mbit/s\n", throughput);
+}
 
 // Callback function
 //
@@ -91,16 +133,12 @@ static void symCallback(void *pCallbackTag,
                         CpaBufferList *pDstBuffer,
                         CpaBoolean verifyResult)
 {
-    if (NULL != pCallbackTag)
-    {
-        /* indicate that the function has been called */
-        COMPLETE((struct COMPLETION_STRUCT *)pCallbackTag);
-    }
+    RT_PRINT_DBG("Callback called with status = %d.\n", status);
+    COMPLETE((struct COMPLETION_STRUCT *)pCallbackTag);
 }
 
-/*
- * This function performs a cipher operation.
- */
+//This function performs a cipher operation.
+//
 static CpaStatus cipherPerformOp(CpaInstanceHandle cyInstHandle,
                                  CpaCySymSessionCtx sessionCtx,
                                  char *src, unsigned int srcLen,
@@ -115,14 +153,6 @@ static CpaStatus cipherPerformOp(CpaInstanceHandle cyInstHandle,
     CpaCySymOpData *pOpData = NULL;
     Cpa32U bufferSize = MAX_HW_BUFSZ;
     Cpa32U numBuffers = 1;  // Only user 1 buffer in this case
-
-    // Check srcLen is times of AES_BLOCKSZ Bytes (256 bits)
-    int q = srcLen / AES_BLOCKSZ;
-    int r = srcLen % AES_BLOCKSZ;
-    if (r != 0) {
-        PRINT_ERR("Length of src is invalid\n");
-        return CPA_STATUS_FAIL;
-    }
 
     // Allocate memory for bufferlist and array of flat buffers in a contiguous
     // area and carve it up to reduce number of memory allocations required.
@@ -149,10 +179,20 @@ static CpaStatus cipherPerformOp(CpaInstanceHandle cyInstHandle,
     pBufferList->numBuffers = 1;
     pBufferList->pPrivateMetaData = pBufferMeta;
 
-    // \begin consume data block by block where block size is MAX_HW_BUFSZ (4MB)
-    int round, off;
-    for (round = 0, off = 0; round < q; round++, off += bufferSize) {
-        memcpy(pSrcBuffer, src + off, bufferSize);
+    // \begin consume data block by block whose size is MAX_HW_BUFSZ
+    struct COMPLETION_STRUCT complete;
+    int q = srcLen / bufferSize;
+    int r = srcLen % bufferSize;
+    RT_PRINT_DBG("srcLen / bufferSize = %d, srcLen % bufferSize = %d\n", q, r);
+    if (r != 0) q++;
+
+    RunTime *rt = (RunTime *)calloc(1, sizeof(RunTime));
+    gettimeofday(&rt->timeS, NULL);
+
+    unsigned int bytesToEnc;
+    for (int round = 0, off = 0; round < q; round++, off += bufferSize) {
+        bytesToEnc = (round != q-1) ? bufferSize : srcLen - off;
+        memcpy(pSrcBuffer, src + off, bytesToEnc);
         pFlatBuffer->pData = pSrcBuffer;
         pFlatBuffer->dataLenInBytes = bufferSize;
 
@@ -167,28 +207,44 @@ static CpaStatus cipherPerformOp(CpaInstanceHandle cyInstHandle,
         pOpData->sessionCtx = sessionCtx;
         pOpData->packetType = CPA_CY_SYM_PACKET_TYPE_FULL;
         pOpData->cryptoStartSrcOffsetInBytes = 0;
-        pOpData->messageLenToCipherInBytes = bufferSize;
+        pOpData->messageLenToCipherInBytes = bytesToEnc;
+
+        COMPLETION_INIT(&complete);
+        RT_PRINT_DBG("Round %d (%d): %d bytes in\n", round, q, bufferSize);
 
         CHECK(cpaCySymPerformOp(cyInstHandle,
-                                NULL,              /* data sent as is to the callback function*/
-                                pOpData,           /* operational data struct */
-                                pBufferList,       /* source buffer list */
-                                pBufferList,       /* same src & dst for an in-place operation*/
+                                (void *)&complete,  // data sent as is to the callback function
+                                pOpData,            // operational data struct
+                                pBufferList,        // source buffer list
+                                pBufferList,        // same src & dst for an in-place operation
                                 NULL));
-        memcpy(dst + off, pSrcBuffer, bufferSize);
+        RT_PRINT_DBG("Wait for completion\n");
+        if (!COMPLETION_WAIT(&complete, TIMEOUT_MS)) {
+            RT_PRINT_ERR("Timeout or interruption in cpaCySymPerformOp\n");
+            rc = CPA_STATUS_FAIL;
+            break;
+        }
+
+        RT_PRINT_DBG("Round %d (%d): %d bytes out\n", round, q, bufferSize);
+        memcpy(dst + off, pSrcBuffer, bytesToEnc);
     }
-    // Update dstLen
+
+    gettimeofday(&rt->timeE, NULL);
+    runTimePush(rt);
+
+    // FIXME: update dstLen with summary of size of produced data
     dstLen = srcLen;
 
+    COMPLETION_DESTROY(&complete);
     PHYS_CONTIG_FREE(pSrcBuffer);
-    OS_FREE(pBufferList);
     PHYS_CONTIG_FREE(pBufferMeta);
+    OS_FREE(pBufferList);
     OS_FREE(pOpData);
 
     return rc;
 }
 
-// It's thread-safety
+// It's thread-safety.
 CpaStatus qatAes256EcbSessionInit(QatAes256EcbSession *sess)
 {
     CpaStatus rc = CPA_STATUS_SUCCESS;
@@ -197,23 +253,26 @@ CpaStatus qatAes256EcbSessionInit(QatAes256EcbSession *sess)
 
     // \begin acquire a CY instance
     pthread_mutex_lock(&gQatHardware.mutex);
-    // Find out all available CY instances at first time
-    if (!gQatHardware.isInit) {
-        rc = cpaCyGetNumInstances(&gQatHardware.nrCyInstHandles);
-        if (rc != CPA_STATUS_SUCCESS) {
-            PRINT_ERR("Failed to initialize number of instances.\nn");
+    if (gQatHardware.isInit == -1) {
+        rc = CPA_STATUS_FAIL;
+        goto unlock;
+    } else if (!gQatHardware.isInit) {
+        // Find out all available CY instances at first time
+        if (CPA_STATUS_SUCCESS != cpaCyGetNumInstances(&gQatHardware.nrCyInstHandles) ||
+                gQatHardware.nrCyInstHandles == 0) {
+            RT_PRINT_ERR("No instances found for 'SSL'\n");
+            rc = CPA_STATUS_FAIL;
+            gQatHardware.isInit = -1;
             goto unlock;
         }
-        if (gQatHardware.nrCyInstHandles == 0) {
-            PRINT_ERR("No instances found for 'SSL'\n");
-            PRINT_ERR("Please check your section names in the config file.\n");
-            PRINT_ERR("Also make sure to use config file version 2.\n");
+        if (CPA_STATUS_SUCCESS != cpaCyGetInstances(gQatHardware.nrCyInstHandles,
+                                        gQatHardware.cyInstHandles)) {
+            RT_PRINT_ERR("Failed to initialize instances.\n");
+            rc = CPA_STATUS_FAIL;
+            gQatHardware.isInit = -1;
             goto unlock;
-        }
-        rc = cpaCyGetInstances(MAX_INSTANCES, gQatHardware.cyInstHandles);
-        if (rc != CPA_STATUS_SUCCESS) {
-            PRINT_ERR("Failed to initialize instances.\n");
-            goto unlock;
+        } {
+            gQatHardware.isInit = 1;
         }
     }
     // FIXME: ensure that gQatHardware.idx < gQatHardware.nrCyInstHandles
@@ -227,6 +286,8 @@ unlock:
     CHECK(cpaCyStartInstance(sess->cyInstHandle));
     CHECK(cpaCySetAddressTranslation(sess->cyInstHandle, sampleVirtToPhys));
 
+    sampleCyStartPolling(sess->cyInstHandle);
+
     // We now populate the fields of the session operational data and create
     // the session.  Note that the size required to store a session is
     // implementation-dependent, so we query the API first to determine how
@@ -238,8 +299,8 @@ unlock:
     sessionSetupData.cipherSetupData.cipherAlgorithm =
         CPA_CY_SYM_CIPHER_AES_ECB;
     sessionSetupData.cipherSetupData.pCipherKey = sampleCipherKey;
-    sessionSetupData.cipherSetupData.cipherKeyLenInBytes =
-        sizeof(sampleCipherKey);
+    sessionSetupData.cipherSetupData.cipherKeyLenInBytes = sizeof(sampleCipherKey);
+    RT_PRINT_DBG("@sessionSetupData.cipherSetupData.cipherKeyLenInBytes = %ld\n", sizeof(sampleCipherKey));
     sessionSetupData.cipherSetupData.cipherDirection =
         CPA_CY_SYM_CIPHER_DIRECTION_ENCRYPT;
 
@@ -262,6 +323,7 @@ void qatAes256EcbSessionFree(QatAes256EcbSession *sess)
 {
     cpaCySymRemoveSession(sess->cyInstHandle, sess->ctx);
     PHYS_CONTIG_FREE(sess->ctx);
+    sampleCyStopPolling();
     cpaCyStopInstance(sess->cyInstHandle);
 }
 
@@ -270,28 +332,23 @@ CpaStatus qatAes256EcbEnc(char *src, unsigned int srcLen, char *dst,
 {
     CpaStatus rc = CPA_STATUS_SUCCESS;
     QatAes256EcbSession *sess = calloc(1, sizeof(QatAes256EcbSession));
+    CpaCySymStats64 symStats = {0};
 
     // Acquire a QAT_CY instance & initialize a QAT_CY_SYM_AES_256_ECB session
     qatAes256EcbSessionInit(sess);
     // Perform Cipher operation (sync / async / batch, etc.)
     rc = cipherPerformOp(sess->cyInstHandle, sess->ctx, src, srcLen, dst, dstLen);
-    // Wait for inflight requests before removing session
+    // Wait for inflight requests before free resources
     symSessionWaitForInflightReq(sess->ctx);
+
+    // Print statistics in this session
+    CHECK(cpaCySymQueryStats64(sess->cyInstHandle, &symStats));
+    RT_PRINT("Number of symmetic operation completed: %llu\n",
+            (unsigned long long)symStats.numSymOpCompleted);
+
     qatAes256EcbSessionFree(sess);
 
     return rc;
-}
-
-unsigned int fileSize(FILE *fp)
-{
-    struct stat statbuf;
-    int rc;
-    int fd = fileno(fp);
-
-    rc = fstat(fd, &statbuf);
-    assert(rc == 0);
-
-    return (unsigned int)statbuf.st_size;
 }
 
 // Thread entrypoint.
@@ -302,7 +359,7 @@ void *workerThreadStart(void *threadArgs)
     unsigned int totalBlocks = args->totalBytes / AES_BLOCKSZ;
     unsigned int strideInBlock = totalBlocks / args->nrThread;
     unsigned int remainingBlocks = totalBlocks % args->nrThread;
-    unsigned int offInBytes = (strideInBlock * AES_BLOCKSZ) * args->threadId;
+    unsigned int offInBytes = strideInBlock * args->threadId * AES_BLOCKSZ;
 
     // Assign remaining blocks to last worker
     if (remainingBlocks > 0 && args->threadId == (args->nrThread-1))
@@ -318,9 +375,83 @@ void *workerThreadStart(void *threadArgs)
     return NULL;
 }
 
-void doEncryptFile(char *fileToEncrypt, char *fileToWrite)
+unsigned int fileSize(int fd)
 {
-    // TODO
+    struct stat statbuf;
+    OS_CHECK(fstat(fd, &statbuf));
+    return (unsigned int)statbuf.st_size;
+}
+
+void doEncryptFile(CmdlineArgs *cmdlineArgs)
+{
+    const static int MAX_THREADS = MAX_INSTANCES;
+
+    int fd0 = open(cmdlineArgs->fileToEncrypt, O_RDONLY);
+    OS_CHECK(fd0);
+    int fd1 = open(cmdlineArgs->fileToWrite, O_RDWR|O_CREAT, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH);
+    OS_CHECK(fd1);
+
+    unsigned int totalInBytes = fileSize(fd0);
+    assert(totalInBytes > 0);
+    // Aligned to AES_BLOCKSZ
+    unsigned int r = totalInBytes % AES_BLOCKSZ;
+    unsigned int totalOutBytes = (r == 0) ?
+        totalInBytes : (totalInBytes - r + AES_BLOCKSZ);
+    assert(totalInBytes <= totalOutBytes);
+    // Resize fileToWrite to totalOutBytes
+    OS_CHECK(ftruncate(fd1, totalOutBytes));
+
+    // Use mmap to convert file-style read/write to memory-style read/write
+    char *src = (char *)mmap(NULL, totalInBytes, PROT_READ, MAP_PRIVATE, fd0, 0);
+    assert(src != NULL);
+    char *dst = (char *)mmap(NULL, totalOutBytes, PROT_WRITE, MAP_PRIVATE, fd1, 0);
+    assert(dst != NULL);
+
+    // Since mmap always align size of mmapped memory to PAGE_SIZE (4KB in common)
+    // and AES_BLOCKSZ is a factor of PAGE_SIZE, so aligned totalInBytes
+    // (i.e. totalOutBytes) is less than size of mmapped memory. And, access to
+    // region execeding size of mmaped file will get zero that is exactly we want
+    // in doing encryption with AES. So we can safely use src/dst as input/output
+    // buffer and totalOutBytes as buffer's length. See blow figure:
+    //
+    // Address space of the mmaped fileToEncrypt that is aligned to PAGE_SIZE:
+    // ------------------------------------------------------------------------
+    //     ...    | AES_BLOCK | AES_BLOCK |    ...    | AES_BLOCK |  PADDING  |
+    // ------------------------------------------------------------------------
+    // ----------------totalInBytes (not aligned)------->|
+    // ---------------totalOutBytes (aligned to AES_BLOCK)------->|
+
+    // Prepare thread arguments
+    pthread_t workers[MAX_THREADS];
+    WorkerArgs args[MAX_THREADS];
+    for (int i = 0; i < cmdlineArgs->nrThread; i++) {
+        args[i].src = src;
+        args[i].dst = dst;
+        args[i].totalBytes = totalOutBytes;
+        args[i].nrBatch = cmdlineArgs->nrBatch;
+        args[i].isAsync = cmdlineArgs->isAsync;
+        args[i].nrThread = cmdlineArgs->nrThread;
+        args[i].threadId = i;
+    }
+
+    // Fire up all threads. Note that nrThread-1 pthreads are created and the
+    // main thread is used as a worker as well
+    for (int i = 1; i < cmdlineArgs->nrThread; i++)
+        pthread_create(&workers[i], NULL, workerThreadStart, &args[i]);
+
+    workerThreadStart((void *)&args[0]);
+
+    // Wait for worker threads to complete
+    for (int i = 1; i < cmdlineArgs->nrThread; i++)
+        pthread_join(workers[i], NULL);
+
+    // Show throughput
+    showStats(gRunTimeHead, totalInBytes);
+
+    munmap(src, totalInBytes);
+    munmap(dst, totalOutBytes);
+    close(fd0);
+    close(fd1);
 }
 
 void printUsage(const char *progname)
@@ -379,6 +510,9 @@ int main(int argc, char *argv[])
         printUsage(argv[0]);
         exit(EXIT_FAILURE);
     }
+    // Construct fileToWrite
+    if (strlen(gCmdlineArgs.fileToWrite) == 0)
+        sprintf(gCmdlineArgs.fileToWrite, "%s.enc", gCmdlineArgs.fileToEncrypt);
     // \end parse commandline args
 
     // CHECK(expr) := assert(CPA_STATUS_SUCCESS == (expr)). If assertion fails,
@@ -389,7 +523,7 @@ int main(int argc, char *argv[])
     CHECK(icp_sal_userStartMultiProcess("SSL", CPA_FALSE));
 
     // Enter main function
-    doEncryptFile(gCmdlineArgs.fileToEncrypt, gCmdlineArgs.fileToWrite);
+    doEncryptFile(&gCmdlineArgs);
 
     icp_sal_userStop();
     qaeMemDestroy();

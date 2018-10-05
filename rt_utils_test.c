@@ -32,7 +32,8 @@ int main()
 
     // Test CPA specific assert
     CHECK(CPA_STATUS_SUCCESS);
-    CHECK(emuCpaFuncFailure());
+    CHECK(CPA_STATUS_FAIL); 
+    //CHECK(emuCpaFuncFailure());
 
     return 0;
 }

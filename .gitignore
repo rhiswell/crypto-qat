@@ -1,5 +1,6 @@
 file_encryptor
 calgary*
-oprofile_data/
+oprofile_data*/
 *.opreport
 *_test
+*.out
