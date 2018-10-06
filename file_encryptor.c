@@ -18,18 +18,18 @@
 #include "icp_sal_user.h"
 #include "rt_utils.h"
 
-#define TIMEOUT_MS  5000 /* 5 seconds */
+#define TIMEOUT_MS  5000    // 5 seconds
 #define MAX_PATH    1024
 // Function qatMemAllocNUMA can only allocate a contiguous memory with size up
-// to 4MB, otherwise return error.
+// to 1MB, otherwise return error.
 #define MAX_HW_BUFSZ    1*1024*1024 // 1 MB
 #define AES_BLOCKSZ     32          // 32 Bytes (256 bits)
-#define MAX_INSTANCES   16
+// The following definition refers to /etc/dh895xcc_dev0.conf: SSL:
+#define MAX_INSTANCES   8
+#define MAX_THREADS     MAX_INSTANCES
 
 typedef struct {
-    int isDebug;
-    int isAsync;
-    int nrBatch;
+    int isEnc;
     int nrThread;
     char fileToEncrypt[MAX_PATH];
     char fileToWrite[MAX_PATH];
@@ -38,8 +38,7 @@ typedef struct {
 typedef struct {
     char *src, *dst;
     unsigned int totalBytes;
-    int nrBatch;
-    int isAsync;
+    int isEnc;
     int threadId;
     int nrThread;
 } WorkerArgs;
@@ -69,9 +68,7 @@ static QatHardware gQatHardware = {
     .nrCyInstHandles = 0,
     .idx = 0};
 static CmdlineArgs gCmdlineArgs = {
-    .isDebug = 1,
-    .isAsync = 0,
-    .nrBatch = 1,
+    .isEnc = 1,
     .nrThread = 1};
 
 // 256 bits-long
@@ -105,8 +102,11 @@ void showStats(RunTime *pHead, unsigned int totalBytes)
         usDiff  += (usEnd - usBegin);
     }
 
-    assert(0 != usDiff);
-    assert(0 != totalBytes);
+    if (usDiff == 0 || totalBytes == 0) {
+        RT_PRINT("Too fast to calculate throughput. Try larger workload.\n")
+        return;
+    }
+
     double throughput = ((double)totalBytes * 8) / usDiff;
 
     RT_PRINT("Time taken:     %9.3lf ms\n", usDiff / 1000);
@@ -137,8 +137,8 @@ static void symCallback(void *pCallbackTag,
     COMPLETE((struct COMPLETION_STRUCT *)pCallbackTag);
 }
 
-//This function performs a cipher operation.
-//
+// TODO: This function performs a cipher operation and is critical to encryption's
+// performance. Please implement it as efficient as possible.
 static CpaStatus cipherPerformOp(CpaInstanceHandle cyInstHandle,
                                  CpaCySymSessionCtx sessionCtx,
                                  char *src, unsigned int srcLen,
@@ -152,7 +152,7 @@ static CpaStatus cipherPerformOp(CpaInstanceHandle cyInstHandle,
     CpaFlatBuffer *pFlatBuffer = NULL;
     CpaCySymOpData *pOpData = NULL;
     Cpa32U bufferSize = MAX_HW_BUFSZ;
-    Cpa32U numBuffers = 1;  // Only user 1 buffer in this case
+    Cpa32U numBuffers = 1;  // Only use 1 buffer in this case
 
     // Allocate memory for bufferlist and array of flat buffers in a contiguous
     // area and carve it up to reduce number of memory allocations required.
@@ -183,13 +183,10 @@ static CpaStatus cipherPerformOp(CpaInstanceHandle cyInstHandle,
     struct COMPLETION_STRUCT complete;
     int q = srcLen / bufferSize;
     int r = srcLen % bufferSize;
-    RT_PRINT_DBG("srcLen / bufferSize = %d, srcLen % bufferSize = %d\n", q, r);
+    RT_PRINT_DBG("srcLen / bufferSize = %d, srcLen / bufferSize = %d\n", q, r);
     if (r != 0) q++;
 
-    RunTime *rt = (RunTime *)calloc(1, sizeof(RunTime));
-    gettimeofday(&rt->timeS, NULL);
-
-    unsigned int bytesToEnc;
+    unsigned int bytesToEnc, bytesProduced = 0;
     for (int round = 0, off = 0; round < q; round++, off += bufferSize) {
         bytesToEnc = (round != q-1) ? bufferSize : srcLen - off;
         memcpy(pSrcBuffer, src + off, bytesToEnc);
@@ -210,8 +207,7 @@ static CpaStatus cipherPerformOp(CpaInstanceHandle cyInstHandle,
         pOpData->messageLenToCipherInBytes = bytesToEnc;
 
         COMPLETION_INIT(&complete);
-        RT_PRINT_DBG("Round %d (%d): %d bytes in\n", round, q, bufferSize);
-
+        RT_PRINT_DBG("Round %d (%d): %d bytes in\n", round, q, bytesToEnc);
         CHECK(cpaCySymPerformOp(cyInstHandle,
                                 (void *)&complete,  // data sent as is to the callback function
                                 pOpData,            // operational data struct
@@ -224,16 +220,12 @@ static CpaStatus cipherPerformOp(CpaInstanceHandle cyInstHandle,
             rc = CPA_STATUS_FAIL;
             break;
         }
-
-        RT_PRINT_DBG("Round %d (%d): %d bytes out\n", round, q, bufferSize);
+        RT_PRINT_DBG("Round %d (%d): %d bytes out\n", round, q, bytesToEnc);
         memcpy(dst + off, pSrcBuffer, bytesToEnc);
+        bytesProduced += bytesToEnc;
     }
-
-    gettimeofday(&rt->timeE, NULL);
-    runTimePush(rt);
-
-    // FIXME: update dstLen with summary of size of produced data
-    dstLen = srcLen;
+    dstLen = bytesProduced;
+    assert(dstLen == srcLen);
 
     COMPLETION_DESTROY(&complete);
     PHYS_CONTIG_FREE(pSrcBuffer);
@@ -245,7 +237,7 @@ static CpaStatus cipherPerformOp(CpaInstanceHandle cyInstHandle,
 }
 
 // It's thread-safety.
-CpaStatus qatAes256EcbSessionInit(QatAes256EcbSession *sess)
+CpaStatus qatAes256EcbSessionInit(QatAes256EcbSession *sess, int isEnc)
 {
     CpaStatus rc = CPA_STATUS_SUCCESS;
     Cpa32U sessionCtxSize = 0;
@@ -264,6 +256,8 @@ CpaStatus qatAes256EcbSessionInit(QatAes256EcbSession *sess)
             rc = CPA_STATUS_FAIL;
             gQatHardware.isInit = -1;
             goto unlock;
+        } {
+            RT_PRINT("%d instances found\n", gQatHardware.nrCyInstHandles);
         }
         if (CPA_STATUS_SUCCESS != cpaCyGetInstances(gQatHardware.nrCyInstHandles,
                                         gQatHardware.cyInstHandles)) {
@@ -294,15 +288,16 @@ unlock:
     // much memory to allocate, and then allocate that memory.
     //
     // Populate the session setup structure for the operation required
+    // TODO: please fillup sessionSetupData for AES-256-ECB encrypt/decrypt operation
     sessionSetupData.sessionPriority = CPA_CY_PRIORITY_NORMAL;
     sessionSetupData.symOperation = CPA_CY_SYM_OP_CIPHER;
     sessionSetupData.cipherSetupData.cipherAlgorithm =
         CPA_CY_SYM_CIPHER_AES_ECB;
     sessionSetupData.cipherSetupData.pCipherKey = sampleCipherKey;
     sessionSetupData.cipherSetupData.cipherKeyLenInBytes = sizeof(sampleCipherKey);
-    RT_PRINT_DBG("@sessionSetupData.cipherSetupData.cipherKeyLenInBytes = %ld\n", sizeof(sampleCipherKey));
     sessionSetupData.cipherSetupData.cipherDirection =
-        CPA_CY_SYM_CIPHER_DIRECTION_ENCRYPT;
+        isEnc ? CPA_CY_SYM_CIPHER_DIRECTION_ENCRYPT : CPA_CY_SYM_CIPHER_DIRECTION_DECRYPT;
+    RT_PRINT_DBG("@sessionSetupData.cipherSetupData.cipherKeyLenInBytes = %ld\n", sizeof(sampleCipherKey));
 
     // Determine size of session context to allocate
     CHECK(cpaCySymSessionCtxGetSize(sess->cyInstHandle, &sessionSetupData,
@@ -328,16 +323,22 @@ void qatAes256EcbSessionFree(QatAes256EcbSession *sess)
 }
 
 CpaStatus qatAes256EcbEnc(char *src, unsigned int srcLen, char *dst,
-        unsigned int dstLen)
+        unsigned int dstLen, int isEnc)
 {
     CpaStatus rc = CPA_STATUS_SUCCESS;
     QatAes256EcbSession *sess = calloc(1, sizeof(QatAes256EcbSession));
     CpaCySymStats64 symStats = {0};
 
     // Acquire a QAT_CY instance & initialize a QAT_CY_SYM_AES_256_ECB session
-    qatAes256EcbSessionInit(sess);
+    qatAes256EcbSessionInit(sess, isEnc);
+
     // Perform Cipher operation (sync / async / batch, etc.)
+    RunTime *rt = (RunTime *)calloc(1, sizeof(RunTime));
+    gettimeofday(&rt->timeS, NULL);
     rc = cipherPerformOp(sess->cyInstHandle, sess->ctx, src, srcLen, dst, dstLen);
+    gettimeofday(&rt->timeE, NULL);
+    runTimePush(rt);
+
     // Wait for inflight requests before free resources
     symSessionWaitForInflightReq(sess->ctx);
 
@@ -357,6 +358,9 @@ void *workerThreadStart(void *threadArgs)
     WorkerArgs *args = (WorkerArgs *)threadArgs;
 
     unsigned int totalBlocks = args->totalBytes / AES_BLOCKSZ;
+    // Just check if args->totalBytes is legal: aligned to AES_BLOCKSZ
+    unsigned int remainingBytes = args->totalBytes % AES_BLOCKSZ;
+    assert(remainingBytes == 0);
     unsigned int strideInBlock = totalBlocks / args->nrThread;
     unsigned int remainingBlocks = totalBlocks % args->nrThread;
     unsigned int offInBytes = strideInBlock * args->threadId * AES_BLOCKSZ;
@@ -370,7 +374,7 @@ void *workerThreadStart(void *threadArgs)
     char *dst = args->dst + offInBytes;
     unsigned int dstLen = srcLen;
 
-    CHECK(qatAes256EcbEnc(src, srcLen, dst, dstLen));
+    CHECK(qatAes256EcbEnc(src, srcLen, dst, dstLen, args->isEnc));
 
     return NULL;
 }
@@ -384,8 +388,6 @@ unsigned int fileSize(int fd)
 
 void doEncryptFile(CmdlineArgs *cmdlineArgs)
 {
-    const static int MAX_THREADS = MAX_INSTANCES;
-
     int fd0 = open(cmdlineArgs->fileToEncrypt, O_RDONLY);
     OS_CHECK(fd0);
     int fd1 = open(cmdlineArgs->fileToWrite, O_RDWR|O_CREAT, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH);
@@ -398,13 +400,12 @@ void doEncryptFile(CmdlineArgs *cmdlineArgs)
     unsigned int totalOutBytes = (r == 0) ?
         totalInBytes : (totalInBytes - r + AES_BLOCKSZ);
     assert(totalInBytes <= totalOutBytes);
-    // Resize fileToWrite to totalOutBytes
-    OS_CHECK(ftruncate(fd1, totalOutBytes));
 
     // Use mmap to convert file-style read/write to memory-style read/write
     char *src = (char *)mmap(NULL, totalInBytes, PROT_READ, MAP_PRIVATE, fd0, 0);
     assert(src != NULL);
-    char *dst = (char *)mmap(NULL, totalOutBytes, PROT_WRITE, MAP_PRIVATE, fd1, 0);
+    // Use anonymous mmaped memory here to avoid pre-allocating fileToWrite
+    char *dst = (char *)mmap(NULL, totalOutBytes, PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
     assert(dst != NULL);
 
     // Since mmap always align size of mmapped memory to PAGE_SIZE (4KB in common)
@@ -428,8 +429,7 @@ void doEncryptFile(CmdlineArgs *cmdlineArgs)
         args[i].src = src;
         args[i].dst = dst;
         args[i].totalBytes = totalOutBytes;
-        args[i].nrBatch = cmdlineArgs->nrBatch;
-        args[i].isAsync = cmdlineArgs->isAsync;
+        args[i].isEnc = cmdlineArgs->isEnc;
         args[i].nrThread = cmdlineArgs->nrThread;
         args[i].threadId = i;
     }
@@ -448,20 +448,27 @@ void doEncryptFile(CmdlineArgs *cmdlineArgs)
     // Show throughput
     showStats(gRunTimeHead, totalInBytes);
 
-    munmap(src, totalInBytes);
-    munmap(dst, totalOutBytes);
-    close(fd0);
-    close(fd1);
+    // Print the first AES_BLOCK
+    RT_PRINT_DBG("1st AES_BLOCK @src_buffer: %.*s\n", AES_BLOCKSZ, src);
+    RT_PRINT_DBG("1st AES_BLOCK @dst_buffer: %.*s\n", AES_BLOCKSZ, dst);
+
+    // Flush data in dst_buffer into fileToWrite
+    ssize_t bytesWritten = write(fd1, dst, totalOutBytes);
+    assert(bytesWritten == totalOutBytes);
+
+    OS_CHECK(munmap(src, totalInBytes));
+    OS_CHECK(munmap(dst, totalOutBytes));
+    OS_CHECK(close(fd0));
+    OS_CHECK(close(fd1));
 }
 
 void printUsage(const char *progname)
 {
     printf("Usage: %s [options] <file_to_enc>\n", progname);
     printf("Program options:\n");
-    printf("    -t  --thread <INT>          TODO\n");
-    printf("    -b  --batch-number <INT>    TODO\n");
-    printf("    -s  --(a)sync               TODO\n");
-    printf("    -o  --output-file <PATH>    File to save output data\n");
+    printf("    -t  --thread <INT>          Number of thread to co-operate the given file\n");
+    printf("    -w  --file_to_write <PATH>  File to save output data\n");
+    printf("    -d  --decrypt               Switch to decryption mode\n");
     printf("    -h  --help                  This message\n");
 }
 
@@ -472,29 +479,24 @@ int main(int argc, char *argv[])
     int opt;
 
     static struct option longOptions[] = {
-        {"async",        no_argument,       0, 'a'},
-        {"thread",       required_argument, 0, 't'},
-        {"batch-number", required_argument, 0, 'b'},
-        {"output-file",  required_argument, 0, 'o'},
-        {"help",         no_argument,       0, 'h'},
-        {0,              0,                 0,  0 }
+        {"thread",        required_argument, 0, 't'},
+        {"file_to_write", required_argument, 0, 'w'},
+        {"decrypt",       no_argument,       0, 'd'},
+        {"help",          no_argument,       0, 'h'},
+        {0,               0,                 0,  0 }
     };
 
-    while ((opt = getopt_long(argc, argv, "t:b:o:ah", longOptions, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:w:dh", longOptions, NULL)) != -1) {
         switch (opt) {
-            case 'a':
-                gCmdlineArgs.isAsync = 1;
-                break;
             case 't':
                 gCmdlineArgs.nrThread = atoi(optarg);
-                assert(gCmdlineArgs.nrThread > 0);
+                assert(gCmdlineArgs.nrThread > 0 && gCmdlineArgs.nrThread <= MAX_THREADS);
                 break;
-            case 'b':
-                gCmdlineArgs.nrBatch = atoi(optarg);
-                assert(gCmdlineArgs.nrBatch > 0);
-                break;
-            case 'o':
+            case 'w':
                 sprintf(gCmdlineArgs.fileToWrite, "%s", optarg);
+                break;
+            case 'd':
+                gCmdlineArgs.isEnc = 0;
                 break;
             case 'h':
             case '?':
@@ -511,8 +513,10 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
     // Construct fileToWrite
-    if (strlen(gCmdlineArgs.fileToWrite) == 0)
-        sprintf(gCmdlineArgs.fileToWrite, "%s.enc", gCmdlineArgs.fileToEncrypt);
+    if (strlen(gCmdlineArgs.fileToWrite) == 0) {
+        char *suffix = gCmdlineArgs.isEnc ? "enc" : "dec";
+        sprintf(gCmdlineArgs.fileToWrite, "%s.%s", gCmdlineArgs.fileToEncrypt, suffix);
+    }
     // \end parse commandline args
 
     // CHECK(expr) := assert(CPA_STATUS_SUCCESS == (expr)). If assertion fails,

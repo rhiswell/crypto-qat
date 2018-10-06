@@ -1,7 +1,8 @@
 
 include $(PWD)/common.mk
 
-EXTRA_CFLAGS+=-std=c99
+EXTRA_CFLAGS+=-std=gnu99
+#EXTRA_CFLAGS+=-DRT_DEBUG
 
 OUTPUT_NAME = file_encryptor
 USER_SOURCE_FILES += common/cpa_sample_utils.c file_encryptor.c

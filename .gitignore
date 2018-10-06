@@ -4,3 +4,6 @@ oprofile_data*/
 *.opreport
 *_test
 *.out
+*.enc
+*.gold
+tiny*
