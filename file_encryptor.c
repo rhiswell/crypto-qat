@@ -16,6 +16,7 @@
 #include "cpa_cy_sym.h"
 #include "cpa_sample_utils.h"
 #include "icp_sal_user.h"
+#include "icp_sal_poll.h"
 #include "rt_utils.h"
 
 #define TIMEOUT_MS  5000    // 5 seconds
@@ -54,6 +55,8 @@ typedef struct {
 typedef struct {
     CpaInstanceHandle cyInstHandle;
     CpaCySymSessionCtx ctx;
+    pthread_t workerId;
+    int polling;
 } QatAes256EcbSession;
 
 typedef struct RunTime_ {
@@ -97,8 +100,8 @@ void showStats(RunTime *pHead, unsigned int totalBytes)
     double usDiff         = 0;
 
     for (RunTime *pCurr = pHead; pCurr != NULL; pCurr = pCurr->next) {
-        usBegin = pCurr->timeS.tv_sec * 1e6 + pCurr->timeS.tv_sec;
-        usEnd   = pCurr->timeE.tv_sec * 1e6 + pCurr->timeE.tv_sec;
+        usBegin = pCurr->timeS.tv_sec * 1e6 + pCurr->timeS.tv_usec;
+        usEnd   = pCurr->timeE.tv_sec * 1e6 + pCurr->timeE.tv_usec;
         usDiff  += (usEnd - usBegin);
     }
 
@@ -111,6 +114,19 @@ void showStats(RunTime *pHead, unsigned int totalBytes)
 
     RT_PRINT("Time taken:     %9.3lf ms\n", usDiff / 1000);
     RT_PRINT("Throughput:     %9.3lf Mbit/s\n", throughput);
+}
+
+inline double calInterval(RunTime *rt)
+{
+    unsigned long usBegin = 0;
+    unsigned long usEnd   = 0;
+    double usDiff         = 0;
+
+    usBegin = rt->timeS.tv_sec * 1e6 + rt->timeS.tv_usec;
+    usEnd   = rt->timeE.tv_sec * 1e6 + rt->timeE.tv_usec;
+    usDiff  = (usEnd - usBegin);
+
+    return usDiff / 1000;
 }
 
 // Callback function
@@ -137,6 +153,32 @@ static void symCallback(void *pCallbackTag,
     COMPLETE((struct COMPLETION_STRUCT *)pCallbackTag);
 }
 
+void *pollingThreadStart(void *args)
+{
+    QatAes256EcbSession *sess = (QatAes256EcbSession *)args;
+
+    sess->polling = 1;
+    while (sess->polling) {
+        icp_sal_CyPollInstance(sess->cyInstHandle, 0);
+        OS_SLEEP(10);
+    }
+
+    return NULL;
+}
+
+static void startPolling(QatAes256EcbSession *sess)
+{
+    CpaInstanceInfo2 info2 = {0};
+    CHECK(cpaCyInstanceGetInfo2(sess->cyInstHandle, &info2));
+    if (info2.isPolled == CPA_TRUE)
+        pthread_create(&(sess->workerId), NULL, pollingThreadStart, sess);
+}
+
+static void stopPolling(QatAes256EcbSession *sess)
+{
+    sess->polling = 0;
+}
+
 // TODO: This function performs a cipher operation and is critical to encryption's
 // performance. Please implement it as efficient as possible.
 static CpaStatus cipherPerformOp(CpaInstanceHandle cyInstHandle,
@@ -145,20 +187,30 @@ static CpaStatus cipherPerformOp(CpaInstanceHandle cyInstHandle,
                                  char *dst, unsigned int dstLen)
 {
     CpaStatus rc = CPA_STATUS_SUCCESS;
-
     Cpa8U *pBufferMeta = NULL;
     Cpa32U bufferMetaSize = 0;
     CpaBufferList *pBufferList = NULL;
     CpaFlatBuffer *pFlatBuffer = NULL;
     CpaCySymOpData *pOpData = NULL;
-    Cpa32U bufferSize = MAX_HW_BUFSZ;
-    Cpa32U numBuffers = 1;  // Only use 1 buffer in this case
+
+    const unsigned int kMaxHwBufferSize = MAX_HW_BUFSZ;
+
+    unsigned int q = srcLen / kMaxHwBufferSize;
+    unsigned int r = srcLen % kMaxHwBufferSize;
+    RT_PRINT_DBG("srcLen / kMaxHwBufferSize = %d, srcLen // kMaxHwBufferSize = %d\n", q, r);
+    if (r != 0) q++;
+    Cpa32U numBuffers = q;
+    RT_PRINT_DBG("\t=> numBuffers = %d\n", numBuffers);
+
+    RunTime *rt = (RunTime *)calloc(1, sizeof(RunTime));
+
+    // \begin stage #0: prepare input data
+    gettimeofday(&rt->timeS, NULL);
 
     // Allocate memory for bufferlist and array of flat buffers in a contiguous
     // area and carve it up to reduce number of memory allocations required.
     Cpa32U bufferListMemSize =
         sizeof(CpaBufferList) + (numBuffers * sizeof(CpaFlatBuffer));
-    Cpa8U *pSrcBuffer = NULL;
 
     // Different implementations of the API require different
     // amounts of space to store meta-data associated with buffer
@@ -170,65 +222,87 @@ static CpaStatus cipherPerformOp(CpaInstanceHandle cyInstHandle,
     CHECK(cpaCyBufferListGetMetaSize(cyInstHandle, numBuffers, &bufferMetaSize));
     CHECK(PHYS_CONTIG_ALLOC(&pBufferMeta, bufferMetaSize));
     CHECK(OS_MALLOC(&pBufferList, bufferListMemSize));
-    CHECK(PHYS_CONTIG_ALLOC(&pSrcBuffer, bufferSize));
     CHECK(OS_MALLOC(&pOpData, sizeof(CpaCySymOpData)));
 
     // Increment by sizeof(CpaBufferList) to get at the array of flatbuffers.
     pFlatBuffer = (CpaFlatBuffer *)(pBufferList + 1);
     pBufferList->pBuffers = pFlatBuffer;
-    pBufferList->numBuffers = 1;
+    pBufferList->numBuffers = numBuffers;
     pBufferList->pPrivateMetaData = pBufferMeta;
 
-    // \begin consume data block by block whose size is MAX_HW_BUFSZ
-    struct COMPLETION_STRUCT complete;
-    int q = srcLen / bufferSize;
-    int r = srcLen % bufferSize;
-    RT_PRINT_DBG("srcLen / bufferSize = %d, srcLen / bufferSize = %d\n", q, r);
-    if (r != 0) q++;
-
-    unsigned int bytesToEnc, bytesProduced = 0;
-    for (int round = 0, off = 0; round < q; round++, off += bufferSize) {
-        bytesToEnc = (round != q-1) ? bufferSize : srcLen - off;
-        memcpy(pSrcBuffer, src + off, bytesToEnc);
-        pFlatBuffer->pData = pSrcBuffer;
-        pFlatBuffer->dataLenInBytes = bufferSize;
-
-        // Populate the structure containing the operational data needed
-        // to run the algorithm:
-        // - packet type information (the algorithm can operate on a full
-        //   packet, perform a partial operation and maintain the state or
-        //   complete the last part of a multi-part operation)
-        // - the initialization vector and its length
-        // - the offset in the source buffer
-        // - the length of the source message
-        pOpData->sessionCtx = sessionCtx;
-        pOpData->packetType = CPA_CY_SYM_PACKET_TYPE_FULL;
-        pOpData->cryptoStartSrcOffsetInBytes = 0;
-        pOpData->messageLenToCipherInBytes = bytesToEnc;
-
-        COMPLETION_INIT(&complete);
-        RT_PRINT_DBG("Round %d (%d): %d bytes in\n", round, q, bytesToEnc);
-        CHECK(cpaCySymPerformOp(cyInstHandle,
-                                (void *)&complete,  // data sent as is to the callback function
-                                pOpData,            // operational data struct
-                                pBufferList,        // source buffer list
-                                pBufferList,        // same src & dst for an in-place operation
-                                NULL));
-        RT_PRINT_DBG("Wait for completion\n");
-        if (!COMPLETION_WAIT(&complete, TIMEOUT_MS)) {
-            RT_PRINT_ERR("Timeout or interruption in cpaCySymPerformOp\n");
-            rc = CPA_STATUS_FAIL;
-            break;
-        }
-        RT_PRINT_DBG("Round %d (%d): %d bytes out\n", round, q, bytesToEnc);
-        memcpy(dst + off, pSrcBuffer, bytesToEnc);
-        bytesProduced += bytesToEnc;
+    // Copy data in src buffer to DMAble buffer
+    CpaFlatBuffer *pFlatBufferIter = pFlatBuffer;
+    Cpa32U bufferSize = 0;
+    for (unsigned int i = 0, off = 0; i < numBuffers; i++, off += kMaxHwBufferSize) {
+        bufferSize = (i != numBuffers-1) ? kMaxHwBufferSize : srcLen - off;
+        CHECK(PHYS_CONTIG_ALLOC(&(pFlatBufferIter->pData), bufferSize));
+        pFlatBufferIter->dataLenInBytes = bufferSize;
+        memcpy(pFlatBufferIter->pData, src + off, bufferSize);
+        pFlatBufferIter++;
     }
-    dstLen = bytesProduced;
-    assert(dstLen == srcLen);
 
+    gettimeofday(&rt->timeE, NULL);
+    RT_PRINT("Time taken in stage #0: %.3f\n", calInterval(rt));
+    // \end stage #0: prepare input data
+
+    // \begin stage #1: consume data
+    gettimeofday(&rt->timeS, NULL);
+
+    // Populate the structure containing the operational data needed
+    // to run the algorithm:
+    // - packet type information (the algorithm can operate on a full
+    //   packet, perform a partial operation and maintain the state or
+    //   complete the last part of a multi-part operation)
+    // - the initialization vector and its length
+    // - the offset in the source buffer
+    // - the length of the source message
+    pOpData->sessionCtx = sessionCtx;
+    pOpData->packetType = CPA_CY_SYM_PACKET_TYPE_FULL;
+    pOpData->cryptoStartSrcOffsetInBytes = 0;
+    pOpData->messageLenToCipherInBytes = srcLen;
+
+    struct COMPLETION_STRUCT complete;
+    COMPLETION_INIT(&complete);
+    CHECK(cpaCySymPerformOp(cyInstHandle,
+                            (void *)&complete,  // data sent as is to the callback function
+                            pOpData,            // operational data struct
+                            pBufferList,        // source buffer list
+                            pBufferList,        // same src & dst for an in-place operation
+                            NULL));
+    RT_PRINT_DBG("Wait for completion\n");
+    if (!COMPLETION_WAIT(&complete, TIMEOUT_MS)) {
+        RT_PRINT_ERR("Timeout or interruption in cpaCySymPerformOp\n");
+        rc = CPA_STATUS_FAIL;
+        goto do_exit;
+    }
+
+    gettimeofday(&rt->timeE, NULL);
+    RT_PRINT("Time taken in stage #1: %.3f\n", calInterval(rt));
+    // \end stage #1: cosume data
+
+    // \begin stage #2: copy output back
+    gettimeofday(&rt->timeS, NULL);
+
+    pFlatBufferIter = pFlatBuffer;
+    for (unsigned int i = 0, off = 0; i < numBuffers; i++, off += kMaxHwBufferSize) {
+        RT_PRINT_DBG("@i = %d, @numBuffers = %d\n", i, numBuffers);
+        bufferSize = (i != numBuffers-1) ? kMaxHwBufferSize : srcLen - off;
+        memcpy(dst + off, pFlatBufferIter->pData, bufferSize);
+        pFlatBufferIter++;
+    }
+
+    gettimeofday(&rt->timeE, NULL);
+    RT_PRINT("Time taken in stage #2: %.3f\n", calInterval(rt));
+    // \end stage #2: copy output back
+
+do_exit:
     COMPLETION_DESTROY(&complete);
-    PHYS_CONTIG_FREE(pSrcBuffer);
+    // Free all flat buffers
+    pFlatBufferIter = pFlatBuffer;
+    for (unsigned int i = 0; i < numBuffers; i++) {
+        PHYS_CONTIG_FREE(pFlatBufferIter->pData);
+        pFlatBufferIter++;
+    }
     PHYS_CONTIG_FREE(pBufferMeta);
     OS_FREE(pBufferList);
     OS_FREE(pOpData);
@@ -272,6 +346,7 @@ CpaStatus qatAes256EcbSessionInit(QatAes256EcbSession *sess, int isEnc)
     // FIXME: ensure that gQatHardware.idx < gQatHardware.nrCyInstHandles
     sess->cyInstHandle = gQatHardware.cyInstHandles[gQatHardware.idx++];
 unlock:
+    RT_PRINT_DBG("Exit critical section\n");
     pthread_mutex_unlock(&gQatHardware.mutex);
     CHECK(rc);
     // \end acquire a CY instance
@@ -280,7 +355,7 @@ unlock:
     CHECK(cpaCyStartInstance(sess->cyInstHandle));
     CHECK(cpaCySetAddressTranslation(sess->cyInstHandle, sampleVirtToPhys));
 
-    sampleCyStartPolling(sess->cyInstHandle);
+    startPolling(sess);
 
     // We now populate the fields of the session operational data and create
     // the session.  Note that the size required to store a session is
@@ -318,7 +393,7 @@ void qatAes256EcbSessionFree(QatAes256EcbSession *sess)
 {
     cpaCySymRemoveSession(sess->cyInstHandle, sess->ctx);
     PHYS_CONTIG_FREE(sess->ctx);
-    sampleCyStopPolling();
+    stopPolling(sess);
     cpaCyStopInstance(sess->cyInstHandle);
 }
 
@@ -333,11 +408,7 @@ CpaStatus qatAes256EcbEnc(char *src, unsigned int srcLen, char *dst,
     qatAes256EcbSessionInit(sess, isEnc);
 
     // Perform Cipher operation (sync / async / batch, etc.)
-    RunTime *rt = (RunTime *)calloc(1, sizeof(RunTime));
-    gettimeofday(&rt->timeS, NULL);
     rc = cipherPerformOp(sess->cyInstHandle, sess->ctx, src, srcLen, dst, dstLen);
-    gettimeofday(&rt->timeE, NULL);
-    runTimePush(rt);
 
     // Wait for inflight requests before free resources
     symSessionWaitForInflightReq(sess->ctx);
@@ -434,6 +505,9 @@ void doEncryptFile(CmdlineArgs *cmdlineArgs)
         args[i].threadId = i;
     }
 
+    RunTime *rt = (RunTime *)calloc(1, sizeof(RunTime));
+    gettimeofday(&rt->timeS, NULL);
+
     // Fire up all threads. Note that nrThread-1 pthreads are created and the
     // main thread is used as a worker as well
     for (int i = 1; i < cmdlineArgs->nrThread; i++)
@@ -444,6 +518,9 @@ void doEncryptFile(CmdlineArgs *cmdlineArgs)
     // Wait for worker threads to complete
     for (int i = 1; i < cmdlineArgs->nrThread; i++)
         pthread_join(workers[i], NULL);
+
+    gettimeofday(&rt->timeE, NULL);
+    runTimePush(rt);
 
     // Show throughput
     showStats(gRunTimeHead, totalInBytes);

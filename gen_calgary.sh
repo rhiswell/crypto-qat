@@ -22,7 +22,18 @@ function gen_calgary1G
     done
 }
 
+function gen_calgary512M
+{
+    local calgary_sz=$(du calgary3M | awk '{ print $1 }')
+    local nr_repeats=$(($((512*1024)) / calgary_sz))
+
+    for _ in $(seq 1 $nr_repeats); do
+        cat calgary3M >> calgary512M
+    done
+}
+
 test -e calgary3M || gen_calgary3M
 test -e calgary1G || gen_calgary1G
+test -e calgary512M || gen_calgary512M
 
 exit 0
