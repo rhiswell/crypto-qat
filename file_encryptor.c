@@ -29,12 +29,30 @@
 #define MAX_INSTANCES   8
 #define MAX_THREADS     MAX_INSTANCES
 
+#define ARRAY_LEN(arr)  (sizeof(arr) / sizeof(*(arr)))
+
+typedef struct {
+    const char *name;
+    CpaStatus (*cipherPerformOp)(CpaInstanceHandle cyInstHandle,
+                                 CpaCySymSessionCtx sessionCtx,
+                                 char *src, unsigned int srcLen,
+                                 char *dst, unsigned int dstLen);
+    void (*symCallback)(void *pCallbackTag, CpaStatus status,
+                        const CpaCySymOp operationType, void *pOpData,
+                        CpaBufferList *pDstBuffer, CpaBoolean verifyResult);
+} StrategyPack;
+
 typedef struct {
     int isEnc;
     int nrThread;
     char fileToEncrypt[MAX_PATH];
     char fileToWrite[MAX_PATH];
+    StrategyPack *strategy;
 } CmdlineArgs;
+
+typedef struct {
+    char *dst;
+} CallbackArgs;
 
 typedef struct {
     char *src, *dst;
@@ -70,9 +88,12 @@ static QatHardware gQatHardware = {
     .isInit = 0,
     .nrCyInstHandles = 0,
     .idx = 0};
+// .strategy will be directly accessed by the following functions, so this
+// variable should be global.
 static CmdlineArgs gCmdlineArgs = {
     .isEnc = 1,
-    .nrThread = 1};
+    .nrThread = 1,
+    .strategy = NULL};
 
 // 256 bits-long
 static Cpa8U sampleCipherKey[] = {
@@ -160,7 +181,7 @@ void *pollingThreadStart(void *args)
     sess->polling = 1;
     while (sess->polling) {
         icp_sal_CyPollInstance(sess->cyInstHandle, 0);
-        OS_SLEEP(10);
+        OS_SLEEP(1);
     }
 
     return NULL;
@@ -179,12 +200,22 @@ static void stopPolling(QatAes256EcbSession *sess)
     sess->polling = 0;
 }
 
-// TODO: This function performs a cipher operation and is critical to encryption's
-// performance. Please implement it as efficient as possible.
-static CpaStatus cipherPerformOp(CpaInstanceHandle cyInstHandle,
-                                 CpaCySymSessionCtx sessionCtx,
-                                 char *src, unsigned int srcLen,
-                                 char *dst, unsigned int dstLen)
+static CpaStatus cipherPerformOpUpper(CpaInstanceHandle cyInstHandle,
+                                    CpaCySymSessionCtx sessionCtx,
+                                    char *src, unsigned int srcLen,
+                                    char *dst, unsigned int dstLen)
+{
+    memcpy(dst, src, srcLen);
+    memcpy(dst, src, srcLen);
+    memcpy(dst, src, srcLen);
+
+    return CPA_STATUS_SUCCESS;
+}
+
+static CpaStatus cipherPerformOpOnce(CpaInstanceHandle cyInstHandle,
+                                     CpaCySymSessionCtx sessionCtx,
+                                     char *src, unsigned int srcLen,
+                                     char *dst, unsigned int dstLen)
 {
     CpaStatus rc = CPA_STATUS_SUCCESS;
     Cpa8U *pBufferMeta = NULL;
@@ -193,7 +224,8 @@ static CpaStatus cipherPerformOp(CpaInstanceHandle cyInstHandle,
     CpaFlatBuffer *pFlatBuffer = NULL;
     CpaCySymOpData *pOpData = NULL;
 
-    const unsigned int kMaxHwBufferSize = MAX_HW_BUFSZ;
+    const unsigned int kMaxHwBufferSize = MAX_HW_BUFSZ;         // 1 MB
+    const unsigned int kMaxSwBufferSize = 512 * 1024 * 1024;    // 512 MB
 
     unsigned int q = srcLen / kMaxHwBufferSize;
     unsigned int r = srcLen % kMaxHwBufferSize;
@@ -310,6 +342,236 @@ do_exit:
     return rc;
 }
 
+static CpaStatus cipherPerformOpSync(CpaInstanceHandle cyInstHandle,
+                                     CpaCySymSessionCtx sessionCtx,
+                                     char *src, unsigned int srcLen,
+                                     char *dst, unsigned int dstLen)
+{
+    CpaStatus rc = CPA_STATUS_SUCCESS;
+
+    Cpa8U *pBufferMeta = NULL;
+    Cpa32U bufferMetaSize = 0;
+    CpaBufferList *pBufferList = NULL;
+    CpaFlatBuffer *pFlatBuffer = NULL;
+    CpaCySymOpData *pOpData = NULL;
+    Cpa32U bufferSize = MAX_HW_BUFSZ;
+    Cpa32U numBuffers = 1;  // Only use 1 buffer in this case
+
+    // Allocate memory for bufferlist and array of flat buffers in a contiguous
+    // area and carve it up to reduce number of memory allocations required.
+    Cpa32U bufferListMemSize =
+        sizeof(CpaBufferList) + (numBuffers * sizeof(CpaFlatBuffer));
+    Cpa8U *pSrcBuffer = NULL;
+
+    // Different implementations of the API require different
+    // amounts of space to store meta-data associated with buffer
+    // lists.  We query the API to find out how much space the current
+    // implementation needs, and then allocate space for the buffer
+    // meta data, the buffer list, and for the buffer itself.  We also
+    // allocate memory for the initialization vector.  We then
+    // populate this memory with the required data.
+    CHECK(cpaCyBufferListGetMetaSize(cyInstHandle, numBuffers, &bufferMetaSize));
+    CHECK(PHYS_CONTIG_ALLOC(&pBufferMeta, bufferMetaSize));
+    CHECK(OS_MALLOC(&pBufferList, bufferListMemSize));
+    CHECK(PHYS_CONTIG_ALLOC(&pSrcBuffer, bufferSize));
+    CHECK(OS_MALLOC(&pOpData, sizeof(CpaCySymOpData)));
+
+    // Increment by sizeof(CpaBufferList) to get at the array of flatbuffers.
+    pFlatBuffer = (CpaFlatBuffer *)(pBufferList + 1);
+    pBufferList->pBuffers = pFlatBuffer;
+    pBufferList->numBuffers = 1;
+    pBufferList->pPrivateMetaData = pBufferMeta;
+
+    // \begin consume data block by block whose size is MAX_HW_BUFSZ
+    struct COMPLETION_STRUCT complete;
+    int q = srcLen / bufferSize;
+    int r = srcLen % bufferSize;
+    RT_PRINT_DBG("srcLen / bufferSize = %d, srcLen / bufferSize = %d\n", q, r);
+    if (r != 0) q++;
+
+    unsigned int bytesToEnc, bytesProduced = 0;
+    for (int round = 0, off = 0; round < q; round++, off += bufferSize) {
+        bytesToEnc = (round != q-1) ? bufferSize : srcLen - off;
+        memcpy(pSrcBuffer, src + off, bytesToEnc);
+        pFlatBuffer->pData = pSrcBuffer;
+        pFlatBuffer->dataLenInBytes = bufferSize;
+
+        // Populate the structure containing the operational data needed
+        // to run the algorithm:
+        // - packet type information (the algorithm can operate on a full
+        //   packet, perform a partial operation and maintain the state or
+        //   complete the last part of a multi-part operation)
+        // - the initialization vector and its length
+        // - the offset in the source buffer
+        // - the length of the source message
+        pOpData->sessionCtx = sessionCtx;
+        pOpData->packetType = CPA_CY_SYM_PACKET_TYPE_FULL;
+        pOpData->cryptoStartSrcOffsetInBytes = 0;
+        pOpData->messageLenToCipherInBytes = bytesToEnc;
+
+        COMPLETION_INIT(&complete);
+        RT_PRINT_DBG("Round %d (%d): %d bytes in\n", round, q, bytesToEnc);
+        CHECK(cpaCySymPerformOp(cyInstHandle,
+                                (void *)&complete,  // data sent as is to the callback function
+                                pOpData,            // operational data struct
+                                pBufferList,        // source buffer list
+                                pBufferList,        // same src & dst for an in-place operation
+                                NULL));
+        RT_PRINT_DBG("Wait for completion\n");
+        if (!COMPLETION_WAIT(&complete, TIMEOUT_MS)) {
+            RT_PRINT_ERR("Timeout or interruption in cpaCySymPerformOp\n");
+            rc = CPA_STATUS_FAIL;
+            break;
+        }
+        RT_PRINT_DBG("Round %d (%d): %d bytes out\n", round, q, bytesToEnc);
+        memcpy(dst + off, pSrcBuffer, bytesToEnc);
+        bytesProduced += bytesToEnc;
+    }
+    dstLen = bytesProduced;
+    assert(dstLen == srcLen);
+
+    COMPLETION_DESTROY(&complete);
+    PHYS_CONTIG_FREE(pSrcBuffer);
+    PHYS_CONTIG_FREE(pBufferMeta);
+    OS_FREE(pBufferList);
+    OS_FREE(pOpData);
+
+    return rc;
+}
+
+static void symCallbackAsync(void *pCallbackTag,
+                             CpaStatus status,
+                             const CpaCySymOp operationType,
+                             void *pOpData_,
+                             CpaBufferList *pDstBuffer,
+                             CpaBoolean verifyResult)
+{
+    RT_PRINT_DBG("Callback called with status = %d.\n", status);
+    CallbackArgs *cbArgs = (CallbackArgs *)pCallbackTag;
+    CpaCySymOpData *pOpData = (CpaCySymOpData *)pOpData_;
+
+    // \begin stage 2: copy result back & do post clean
+    for (unsigned int i = 0, off = 0; i < pDstBuffer->numBuffers;
+            i++, off += ((pDstBuffer->pBuffers)+i)->dataLenInBytes) {
+        if (off + ((pDstBuffer->pBuffers)+i)->dataLenInBytes >
+                pOpData->messageLenToCipherInBytes) {
+            memcpy((cbArgs->dst)+off, ((pDstBuffer->pBuffers)+i)->pData,
+                    pOpData->messageLenToCipherInBytes - off);
+            off += (pOpData->messageLenToCipherInBytes - off);
+            break;
+        }
+        memcpy((cbArgs->dst)+off, ((pDstBuffer->pBuffers)+i)->pData,
+                ((pDstBuffer->pBuffers)+i)->dataLenInBytes);
+    }
+
+    // Do post clean
+    PHYS_CONTIG_FREE(pDstBuffer->pPrivateMetaData);
+    for (int i = 0; i < pDstBuffer->numBuffers; i++)
+        PHYS_CONTIG_FREE(((pDstBuffer->pBuffers)+i)->pData);
+    OS_FREE(pDstBuffer);
+    OS_FREE(pOpData);
+    // \end starge 2: copy result back & do post clean
+}
+
+static CpaStatus cipherPerformOpAsync(CpaInstanceHandle cyInstHandle,
+                                      CpaCySymSessionCtx sessionCtx,
+                                      char *src, unsigned int srcLen,
+                                      char *dst, unsigned int dstLen)
+{
+    CpaStatus rc = CPA_STATUS_SUCCESS;
+
+    const unsigned int kMaxHwBufferSize = MAX_HW_BUFSZ;
+    const unsigned int numBuffers = 1;
+
+    unsigned int bufferSize = numBuffers * kMaxHwBufferSize;
+    RT_PRINT_DBG("@bufferSize = %d\n", bufferSize);
+    unsigned int q = srcLen / bufferSize;
+    unsigned int r = srcLen % bufferSize;
+    RT_PRINT_DBG("@srcLen / bufferSize = %d, @srcLen // bufferSize = %d\n", q, r)
+    if (r != 0) q++;
+    RT_PRINT_DBG("\t => round = %d\n", q);
+
+    unsigned int off = 0;
+    for (unsigned int i = 0; i < q; i++) {
+
+        RT_PRINT_DBG("@q = %d, @i = %d\n", q, i);
+
+        CallbackArgs *cbArgs = (CallbackArgs *)calloc(1, sizeof(CallbackArgs));
+        cbArgs->dst = dst + off;
+
+        // \begin stage 0: alloc buffer & copy data to input buffer
+        Cpa8U *pBufferMeta = NULL;
+        Cpa32U bufferMetaSize = 0;
+        CpaBufferList *pBufferList = NULL;
+        CpaFlatBuffer *pFlatBuffer = NULL;
+        CpaCySymOpData *pOpData = NULL;
+        Cpa32U bufferListMemSize =
+            sizeof(CpaBufferList) + (numBuffers * sizeof(CpaFlatBuffer));
+
+        RT_PRINT_DBG("CP#0\n");
+
+        CHECK(cpaCyBufferListGetMetaSize(cyInstHandle, numBuffers, &bufferMetaSize));
+        CHECK(PHYS_CONTIG_ALLOC(&pBufferMeta, bufferMetaSize));
+        CHECK(OS_MALLOC(&pBufferList, bufferListMemSize));
+        CHECK(OS_MALLOC(&pOpData, sizeof(CpaCySymOpData)));
+
+        RT_PRINT_DBG("CP#1\n");
+
+        // Increment by sizeof(CpaBufferList) to get at the array of flatbuffers.
+        pFlatBuffer = (CpaFlatBuffer *)(pBufferList + 1);
+        for (int j = 0; j < numBuffers; j++) {
+            CHECK(PHYS_CONTIG_ALLOC(&((pFlatBuffer + j)->pData), kMaxHwBufferSize));
+            (pFlatBuffer + j)->dataLenInBytes = kMaxHwBufferSize;
+        }
+        pBufferList->pBuffers = pFlatBuffer;
+        pBufferList->numBuffers = numBuffers;
+        pBufferList->pPrivateMetaData = pBufferMeta;
+
+        RT_PRINT_DBG("CP#2\n");
+
+        // Do copy
+        unsigned int bytesToEnc = 0;
+        for (int j = 0; j < numBuffers; j++, off += kMaxHwBufferSize) {
+            RT_PRINT_DBG("@q = %d, @i = %d, @j = %d\n", q, i, j);
+            // Break if meets the last fragement
+            if (off + kMaxHwBufferSize > srcLen) {
+                RT_PRINT_DBG("dataLen = %d, bytesToCopy = %d\n",
+                        (pFlatBuffer + j)->dataLenInBytes, srcLen - off);
+                memcpy((pFlatBuffer + j)->pData, src + off, srcLen - off);
+                bytesToEnc += (srcLen - off);
+                off += (srcLen - off);
+                break;
+            }
+            RT_PRINT_DBG("dataLen = %d, bytesToCopy = %d\n",
+                    (pFlatBuffer + j)->dataLenInBytes, kMaxHwBufferSize);
+            memcpy((pFlatBuffer + j)->pData, src + off, kMaxHwBufferSize);
+            bytesToEnc += kMaxHwBufferSize;
+        }
+
+        RT_PRINT_DBG("CP#3\n");
+
+        // \end stage 0: alloc buffer & copy data to input buffer
+
+        // \begin stage 1: call QAT API to do encrypt
+        pOpData->sessionCtx = sessionCtx;
+        pOpData->packetType = CPA_CY_SYM_PACKET_TYPE_FULL;
+        pOpData->cryptoStartSrcOffsetInBytes = 0;
+        pOpData->messageLenToCipherInBytes = bytesToEnc;
+        CHECK(cpaCySymPerformOp(cyInstHandle,
+                                (void *)cbArgs,     // data sent as is to the callback function
+                                pOpData,            // operational data struct
+                                pBufferList,        // source buffer list
+                                pBufferList,        // same src & dst for an in-place operation
+                                NULL));
+        // \end stage 1: call QAT API to do encrypt
+        //
+        RT_PRINT_DBG("CP#4\n");
+    }
+    assert(off == srcLen);
+
+    return rc;
+}
+
 // It's thread-safety.
 CpaStatus qatAes256EcbSessionInit(QatAes256EcbSession *sess, int isEnc)
 {
@@ -363,7 +625,6 @@ unlock:
     // much memory to allocate, and then allocate that memory.
     //
     // Populate the session setup structure for the operation required
-    // TODO: please fillup sessionSetupData for AES-256-ECB encrypt/decrypt operation
     sessionSetupData.sessionPriority = CPA_CY_PRIORITY_NORMAL;
     sessionSetupData.symOperation = CPA_CY_SYM_OP_CIPHER;
     sessionSetupData.cipherSetupData.cipherAlgorithm =
@@ -381,9 +642,9 @@ unlock:
     CHECK(PHYS_CONTIG_ALLOC(&sess->ctx, sessionCtxSize));
     // Initialize the Cipher session
     CHECK(cpaCySymInitSession(sess->cyInstHandle,
-                              symCallback,       // callback function
-                              &sessionSetupData, // session setup data
-                              sess->ctx));       // output of the function
+                              (gCmdlineArgs.strategy)->symCallback, // callback function
+                              &sessionSetupData,                    // session setup data
+                              sess->ctx));                          // output of the function
     // \end setup a QAT_AES-256-ECB session
 
     return rc;
@@ -408,7 +669,8 @@ CpaStatus qatAes256EcbEnc(char *src, unsigned int srcLen, char *dst,
     qatAes256EcbSessionInit(sess, isEnc);
 
     // Perform Cipher operation (sync / async / batch, etc.)
-    rc = cipherPerformOp(sess->cyInstHandle, sess->ctx, src, srcLen, dst, dstLen);
+    rc = (gCmdlineArgs.strategy)->
+        cipherPerformOp(sess->cyInstHandle, sess->ctx, src, srcLen, dst, dstLen);
 
     // Wait for inflight requests before free resources
     symSessionWaitForInflightReq(sess->ctx);
@@ -545,6 +807,7 @@ void printUsage(const char *progname)
     printf("Program options:\n");
     printf("    -t  --thread <INT>          Number of thread to co-operate the given file\n");
     printf("    -w  --file_to_write <PATH>  File to save output data\n");
+    printf("    -s  --strategy <STRING>     Which optimization strategy to use\n");
     printf("    -d  --decrypt               Switch to decryption mode\n");
     printf("    -h  --help                  This message\n");
 }
@@ -552,18 +815,28 @@ void printUsage(const char *progname)
 // About code style: since QAT APIs use camel case, we begin to follow it.
 int main(int argc, char *argv[])
 {
+
+    static StrategyPack strategies[] = {
+        {"sync", cipherPerformOpSync, symCallback},
+        {"once", cipherPerformOpOnce, symCallback},
+        {"upper", cipherPerformOpUpper, symCallback},
+        {"async", cipherPerformOpAsync, symCallbackAsync}};
+
+    // Use "sync" by default
+    gCmdlineArgs.strategy = &strategies[0];
+
     // \begin parse commandline args
     int opt;
 
     static struct option longOptions[] = {
         {"thread",        required_argument, 0, 't'},
         {"file_to_write", required_argument, 0, 'w'},
+        {"strategy",      required_argument, 0, 's'},
         {"decrypt",       no_argument,       0, 'd'},
         {"help",          no_argument,       0, 'h'},
-        {0,               0,                 0,  0 }
-    };
+        {0,               0,                 0,  0 }};
 
-    while ((opt = getopt_long(argc, argv, "t:w:dh", longOptions, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:w:s:dh", longOptions, NULL)) != -1) {
         switch (opt) {
             case 't':
                 gCmdlineArgs.nrThread = atoi(optarg);
@@ -574,6 +847,16 @@ int main(int argc, char *argv[])
                 break;
             case 'd':
                 gCmdlineArgs.isEnc = 0;
+                break;
+            case 's':
+                for (int i = 0; i < ARRAY_LEN(strategies); i++) {
+                    if (strcmp(optarg, strategies[i].name) == 0) {
+                        gCmdlineArgs.strategy = &strategies[i];
+                        break;
+                    }
+                }
+                // Check if given strategy name is legal or go die
+                assert(strcmp((gCmdlineArgs.strategy)->name, optarg) == 0);
                 break;
             case 'h':
             case '?':
